@@ -972,7 +972,7 @@ impl eframe::App for Window {
             ui.add_space(6.0);
 
             let (title, subtitle) = if !known || (now.title.is_empty() && !receiving) {
-                ("Waiting for your iPhone".to_string(), format!("Control Center \u{203A} AirPlay \u{203A} {speaker_name}"))
+                ("Waiting for your iPhone".to_string(), format!("Pick \u{201C}{speaker_name}\u{201D} in your iPhone's AirPlay list"))
             } else if now.title.is_empty() {
                 ("Playing".to_string(), now.client.clone())
             } else {

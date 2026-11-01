@@ -1,6 +1,6 @@
 [package]
 name = "airplay-receiver"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 description = "Turn a Windows PC into an AirPlay speaker, with track info, remote control and an output picker."
 license = "GPL-3.0-only"
