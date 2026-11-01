@@ -1,0 +1,411 @@
+diff --git a/src/dacp/mod.rs b/src/dacp/mod.rs
+index 3635421..73f1cbe 100644
+--- a/src/dacp/mod.rs
++++ b/src/dacp/mod.rs
+@@ -5,7 +5,9 @@
+ //! playback (play/pause, next, previous, volume, etc.).
+ 
+ use std::io::{Read, Write};
+-use std::net::SocketAddr;
++use std::net::{IpAddr, SocketAddr, TcpStream};
++use std::sync::Mutex;
++use std::sync::atomic::{AtomicBool, Ordering};
+ use std::time::Duration;
+ 
+ use crate::error::NetworkError;
+@@ -39,7 +41,7 @@ fn discover_dacp_port(dacp_id: &str, _remote_ip: std::net::IpAddr) -> Option<u16
+     let daemon = mdns_sd::ServiceDaemon::new().ok()?;
+     let receiver = daemon.browse("_dacp._tcp.local.").ok()?;
+     let target = dacp_id.to_uppercase();
+-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
++    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+ 
+     while std::time::Instant::now() < deadline {
+         match receiver.recv_timeout(deadline.duration_since(std::time::Instant::now())) {
+@@ -84,52 +86,70 @@ pub(crate) struct DacpClient {
+     /// DACP-ID from the RTSP session. Identifies the `_dacp._tcp` mDNS service.
+     dacp_id: String,
+     active_remote: String,
+-    addr: Option<SocketAddr>,
++    remote_ip: IpAddr,
++    addr: Mutex<SocketAddr>,
++    found: AtomicBool,
+ }
+ 
+ impl DacpClient {
+     /// Create a new DACP client from the values received in the AirPlay session.
+-    pub(crate) fn new(dacp_id: &str, active_remote: &str) -> Self {
++    pub(crate) fn new(dacp_id: &str, active_remote: &str, remote_ip: IpAddr) -> Self {
+         Self {
+             dacp_id: dacp_id.to_string(),
+             active_remote: active_remote.to_string(),
+-            addr: None,
++            remote_ip,
++            addr: Mutex::new(SocketAddr::new(remote_ip, DACP_DEFAULT_PORT)),
++            found: AtomicBool::new(false),
+         }
+     }
+ 
+-    /// Discover the Apple device's DACP service via mDNS.
+-    ///
+-    /// Browses `_dacp._tcp.local.` for a service matching the DACP-ID,
+-    /// with a 2-second timeout. Falls back to port 3689 on the remote IP
+-    /// if mDNS discovery fails.
+-    pub(crate) fn discover_from_remote(&mut self, remote_ip: std::net::IpAddr) {
+-        self.addr = match discover_dacp_port(&self.dacp_id, remote_ip) {
+-            Some(port) => {
+-                debug!(port, dacp_id = %self.dacp_id, "DACP service discovered via mDNS");
+-                Some(SocketAddr::new(remote_ip, port))
+-            }
+-            None => {
+-                debug!(dacp_id = %self.dacp_id, "DACP mDNS discovery failed, falling back to port 3689");
+-                Some(SocketAddr::new(remote_ip, DACP_DEFAULT_PORT))
+-            }
+-        };
++    /// Look for the Apple device's DACP service via mDNS (`_dacp._tcp.local.`),
++    /// up to 3 seconds. The current address stays if nothing turns up.
++    pub(crate) fn discover(&self) {
++        debug!(active_remote = %self.active_remote, ip = %self.remote_ip, "DACP session");
++        if let Some(port) = discover_dacp_port(&self.dacp_id, self.remote_ip) {
++            debug!(port, dacp_id = %self.dacp_id, "DACP service discovered via mDNS");
++            *self.addr.lock().unwrap() = SocketAddr::new(self.remote_ip, port);
++            self.found.store(true, Ordering::Relaxed);
++        } else {
++            debug!(dacp_id = %self.dacp_id, "DACP mDNS discovery found nothing");
++        }
++    }
++
++    fn connect(&self) -> Result<(TcpStream, SocketAddr), std::io::Error> {
++        let timeout = Duration::from_secs(2);
++        // A command straight after connecting shouldn't waste seconds on the default port.
++        if !self.found.load(Ordering::Relaxed) {
++            self.discover();
++        }
++        let addr = *self.addr.lock().unwrap();
++        if let Ok(stream) = TcpStream::connect_timeout(&addr, timeout) {
++            return Ok((stream, addr));
++        }
++        // Not found yet, or the port moved. Look again once.
++        self.discover();
++        let addr = *self.addr.lock().unwrap();
++        Ok((TcpStream::connect_timeout(&addr, timeout)?, addr))
+     }
+ 
+     /// Send a raw DACP command from synchronous callbacks.
+     pub(crate) fn command_blocking(&self, path: &str) -> Result<(), NetworkError> {
+-        let addr = self.addr.ok_or_else(|| {
+-            NetworkError::Mdns("DACP not discovered yet — call discover() first".into())
+-        })?;
+-
+-        let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
++        let (mut stream, addr) = self.connect()?;
+         stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+         stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+         let request = self.command_request(path, addr);
+         stream.write_all(request.as_bytes())?;
+ 
+         let mut buf = [0u8; 1024];
+-        let _ = stream.read(&mut buf);
+-        Ok(())
++        let n = stream.read(&mut buf).unwrap_or(0);
++        let reply = String::from_utf8_lossy(&buf[..n]);
++        let status = reply.lines().next().unwrap_or("no reply");
++        tracing::info!(path, status, "DACP command");
++        if status.contains(" 2") {
++            Ok(())
++        } else {
++            Err(NetworkError::Mdns(format!("{path}: {status}")))
++        }
+     }
+ 
+     pub(crate) fn play_pause_blocking(&self) -> Result<(), NetworkError> {
+diff --git a/src/net/mdns.rs b/src/net/mdns.rs
+index cb0fa04..6cf06dc 100644
+--- a/src/net/mdns.rs
++++ b/src/net/mdns.rs
+@@ -24,7 +24,7 @@ pub(crate) const RAOP_SS: &str = "16";
+ /// Protocol version.
+ pub(crate) const RAOP_VN: &str = "3";
+ /// Transport protocols.
+-pub(crate) const RAOP_TP: &str = "TCP,UDP";
++pub(crate) const RAOP_TP: &str = "UDP";
+ /// Metadata types: 0=text, 1=artwork, 2=progress.
+ pub(crate) const RAOP_MD: &str = "0,1,2";
+ /// System managed.
+@@ -47,7 +47,7 @@ pub(crate) const GLOBAL_FEATURES: u32 = 0x7;
+ /// Device model identifier.
+ pub(crate) const GLOBAL_MODEL: &str = crate::raop::config::GLOBAL_MODEL;
+ /// Software version string.
+-pub(crate) const GLOBAL_VERSION: &str = "130.14";
++pub(crate) const GLOBAL_VERSION: &str = "105.1";
+ 
+ // --- AP2 mDNS TXT record constants ---
+ 
+@@ -116,6 +116,7 @@ impl AirPlayServiceInfo {
+             ("vs".into(), GLOBAL_VERSION.into()),
+             ("sm".into(), RAOP_SM.into()),
+             ("ek".into(), RAOP_EK.into()),
++            ("am".into(), "AirPlayReceiver".into()),
+         ];
+ 
+         let airplay_txt = vec![
+@@ -210,6 +211,7 @@ impl AirPlayServiceInfo {
+ }
+ 
+ /// Convert TXT record pairs to a `HashMap` for mDNS registration.
++#[cfg(target_os = "macos")]
+ fn txt_map(txt: &[(String, String)]) -> std::collections::HashMap<String, String> {
+     txt.iter().cloned().collect()
+ }
+@@ -313,7 +315,8 @@ impl MdnsService {
+             &format!("{}.local.", gethostname::gethostname().to_string_lossy()),
+             "",
+             info.port,
+-            txt_map(&info.raop_txt),
++            // A slice keeps TXT order; iPhones have been picky about txtvers coming first.
++            &info.raop_txt[..],
+         )
+         .map(|svc| svc.enable_addr_auto())
+         .map_err(|e| NetworkError::Mdns(format!("{e}")))?;
+@@ -351,8 +354,11 @@ impl MdnsService {
+ 
+     /// Unregister the _raop._tcp mDNS service.
+     pub(crate) fn unregister_raop(&mut self) {
+-        if let Some(name) = self.raop_fullname.take() {
+-            let _ = self.daemon.unregister(&name);
++        if let Some(name) = self.raop_fullname.take()
++            && let Ok(done) = self.daemon.unregister(&name)
++        {
++            // Waits for the goodbye to go out, so phones drop the old name right away.
++            let _ = done.recv_timeout(std::time::Duration::from_secs(1));
+         }
+     }
+ 
+diff --git a/src/proto/dmap.rs b/src/proto/dmap.rs
+index 5c7771f..d61c631 100644
+--- a/src/proto/dmap.rs
++++ b/src/proto/dmap.rs
+@@ -20,6 +20,8 @@ pub struct TrackMetadata {
+     pub track_number: Option<u16>,
+     /// Disc number (`asdk`).
+     pub disc_number: Option<u16>,
++    /// The sender's play status (`caps`). An iPhone sends 1 playing, 2 paused.
++    pub play_status: Option<u8>,
+ }
+ 
+ impl TrackMetadata {
+@@ -47,8 +49,9 @@ impl TrackMetadata {
+                 b"astm" => meta.duration_ms = as_u32(),
+                 b"astn" => meta.track_number = as_u16(),
+                 b"asdk" => meta.disc_number = as_u16(),
++                b"caps" => meta.play_status = chunk.first().copied(),
+                 _ => {
+-                    tracing::trace!(tag = %String::from_utf8_lossy(tag), len, "DMAP: unknown tag");
++                    tracing::debug!(tag = %String::from_utf8_lossy(tag), value = ?&chunk[..len.min(16)], "DMAP: other tag");
+                 }
+             }
+             pos += len;
+diff --git a/src/raop/buffer.rs b/src/raop/buffer.rs
+index 19c9a62..1421e93 100644
+--- a/src/raop/buffer.rs
++++ b/src/raop/buffer.rs
+@@ -17,7 +17,7 @@ pub const RAOP_AESIV_LEN: usize = 16;
+ /// Maximum RTP packet size (including 12-byte header).
+ pub(crate) const RAOP_PACKET_LEN: usize = 32768;
+ /// Number of slots in the circular buffer. Must be a power of two for modulo indexing.
+-const RAOP_BUFFER_LENGTH: usize = 32;
++pub(crate) const RAOP_BUFFER_LENGTH: usize = 64;
+ /// Default silence-frame length (samples per channel) for PCM streams before the
+ /// first packet establishes the real frame size. 352 matches the classic AirPlay
+ /// ALAC frame; it is only used to size silence for a missing *first* packet.
+diff --git a/src/raop/handlers_ap1.rs b/src/raop/handlers_ap1.rs
+index 9363c02..ab8a22b 100644
+--- a/src/raop/handlers_ap1.rs
++++ b/src/raop/handlers_ap1.rs
+@@ -396,10 +396,8 @@ pub(crate) fn handle_record(
+     _request: &HttpRequest,
+     response: &mut HttpResponse,
+ ) -> Option<Vec<u8>> {
+-    // Mirror the AP2 RECORD response: classic RAOP clients expect an
+-    // Audio-Latency header. The value is a placeholder — actual playback
+-    // timing is handled by the RTP layer, not advertised here.
+-    response.add_header("Audio-Latency", "0");
++    // 11025 + the sender's own 77175 frames is the classic 2.0 s total latency.
++    response.add_header("Audio-Latency", "11025");
+     None
+ }
+ 
+@@ -456,6 +454,7 @@ pub(crate) fn handle_set_parameter(
+             }
+         }
+         "image/jpeg" | "image/png" => conn.shared.handler.on_coverart(data),
++        "image/none" => conn.shared.handler.on_coverart(&[]),
+         "application/x-dmap-tagged" => {
+             let meta = crate::proto::dmap::TrackMetadata::from_dmap(data);
+             conn.shared.handler.on_metadata(&meta);
+diff --git a/src/raop/mod.rs b/src/raop/mod.rs
+index 1e012ca..9725dc6 100644
+--- a/src/raop/mod.rs
++++ b/src/raop/mod.rs
+@@ -45,13 +45,12 @@ mod server;
+ pub use server::{RaopServer, RaopServerBuilder};
+ 
+ pub(crate) struct DacpRemoteControl {
+-    client: crate::dacp::DacpClient,
++    client: std::sync::Arc<crate::dacp::DacpClient>,
+ }
+ 
+ impl DacpRemoteControl {
+     /// Create a new DACP remote control client for the given iPhone.
+     pub(crate) fn new(dacp_id: &str, active_remote: &str, remote_addr: &[u8]) -> Self {
+-        let mut client = crate::dacp::DacpClient::new(dacp_id, active_remote);
+         let ip = match remote_addr.len() {
+             4 => std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                 remote_addr[0],
+@@ -66,7 +65,10 @@ impl DacpRemoteControl {
+             }
+             _ => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+         };
+-        client.discover_from_remote(ip);
++        let client = std::sync::Arc::new(crate::dacp::DacpClient::new(dacp_id, active_remote, ip));
++        // Finding the phone's port takes up to seconds; SETUP shouldn't wait for it.
++        let finder = client.clone();
++        std::thread::spawn(move || finder.discover());
+         Self { client }
+     }
+ }
+@@ -81,6 +83,7 @@ impl RemoteControl for DacpRemoteControl {
+             RemoteCommand::ToggleShuffle => self.client.set_shuffle_blocking(true),
+             RemoteCommand::ToggleRepeat => self.client.set_repeat_blocking(1),
+             RemoteCommand::Stop => self.client.stop_blocking(),
++            RemoteCommand::Raw(path) => self.client.command_blocking(&format!("/ctrl-int/1/{path}")),
+         };
+         result.map_err(crate::error::ShairplayError::Network)
+     }
+diff --git a/src/raop/rtp.rs b/src/raop/rtp.rs
+index 7be0e79..c762b5e 100644
+--- a/src/raop/rtp.rs
++++ b/src/raop/rtp.rs
+@@ -20,7 +20,7 @@ use tokio::sync::{Mutex, watch};
+ use tracing::info;
+ 
+ use crate::error::{NetworkError, ShairplayError};
+-use crate::raop::buffer::{RAOP_PACKET_LEN, RaopBuffer, StreamFormat};
++use crate::raop::buffer::{RAOP_BUFFER_LENGTH, RAOP_PACKET_LEN, RaopBuffer, StreamFormat};
+ use crate::raop::{AudioCodec, AudioFormat, AudioHandler};
+ 
+ /// Sentinel value for [`RtpState::flush`] indicating no flush is pending.
+@@ -134,6 +134,8 @@ pub(crate) struct RaopRtp {
+     buffer: Arc<Mutex<RaopBuffer>>,
+     /// Shared mutable state for cross-task event delivery.
+     state: Arc<Mutex<RtpState>>,
++    /// Wakes the receive task so a flush acts at once, even with no packets arriving.
++    flush_wake: Arc<tokio::sync::Notify>,
+     /// Send `true` to shut down the receive task.
+     shutdown_tx: Option<watch::Sender<bool>>,
+     /// iPhone's control port (0 = no retransmits).
+@@ -188,6 +190,7 @@ impl RaopRtp {
+             format,
+             buffer: Arc::new(Mutex::new(buffer)),
+             state: Arc::new(Mutex::new(RtpState { flush: NO_FLUSH })),
++            flush_wake: Arc::new(tokio::sync::Notify::new()),
+             shutdown_tx: None,
+             control_rport: 0,
+             control_lport: 0,
+@@ -256,11 +259,16 @@ impl RaopRtp {
+             // If control_rport is 0, the iPhone doesn't support retransmits.
+             let no_resend = control_rport == 0;
+             let _remote_for_task = self.remote.clone();
++            let flush_wake = self.flush_wake.clone();
++            let mut remote_control = self.remote_socket;
++            remote_control.set_port(control_rport);
+ 
+             tokio::spawn(async move {
+                 let mut shutdown_rx = shutdown_rx;
+                 let mut data_packet = [0u8; RAOP_PACKET_LEN];
+                 let mut ctrl_packet = [0u8; RAOP_PACKET_LEN];
++                // Next sequence number we expect, for spotting lost packets.
++                let mut expected: Option<u16> = None;
+                 loop {
+                     // Drain flush events only — metadata goes through AudioHandler now.
+                     {
+@@ -269,14 +277,31 @@ impl RaopRtp {
+                             buffer.lock().await.flush(st.flush);
+                             session.audio_flush();
+                             st.flush = NO_FLUSH;
++                            expected = None;
+                         }
+                     }
+ 
+                     tokio::select! {
++                        _ = flush_wake.notified() => {}
+                         // Data channel: audio RTP packets.
+                         result = dsock.recv_from(&mut data_packet) => {
+                             if let Ok((len, _)) = result
+                                 && len >= 12 {
++                                    let seq = u16::from_be_bytes([data_packet[2], data_packet[3]]);
++                                    if let Some(want) = expected {
++                                        let gap = seq.wrapping_sub(want);
++                                        if !no_resend && gap > 0 && usize::from(gap) < RAOP_BUFFER_LENGTH {
++                                            tracing::debug!(want, gap, "RTP gap, asking for resend");
++                                            let [w0, w1] = want.to_be_bytes();
++                                            let [g0, g1] = gap.to_be_bytes();
++                                            let req = [0x80, 0xD5, 0, 1, w0, w1, g0, g1];
++                                            let _ = csock.send_to(&req, remote_control).await;
++                                        }
++                                    }
++                                    // Late or resent packets must not move the expectation backwards.
++                                    if expected.is_none_or(|want| seq.wrapping_sub(want) < 0x8000) {
++                                        expected = Some(seq.wrapping_add(1));
++                                    }
+                                     let mut buf = buffer.lock().await;
+                                     buf.queue(&data_packet[..len], true);
+                                     while let Some(samples) = buf.dequeue(no_resend) {
+@@ -414,8 +439,10 @@ impl RaopRtp {
+     /// Request a buffer flush up to the given sequence number.
+     pub(crate) fn flush(&self, next_seq: i32) {
+         let state = self.state.clone();
++        let wake = self.flush_wake.clone();
+         tokio::spawn(async move {
+             state.lock().await.flush = next_seq;
++            wake.notify_one();
+         });
+     }
+ 
+diff --git a/src/raop/rtsp.rs b/src/raop/rtsp.rs
+index 93ae1be..05ed27f 100644
+--- a/src/raop/rtsp.rs
++++ b/src/raop/rtsp.rs
+@@ -351,11 +351,14 @@ fn resolve_record(conn: &RaopConnection) -> Option<Handler> {
+ 
+ /// FLUSH: parse RTP-Info header and flush the buffer inline.
+ fn handle_flush_inline(conn: &mut RaopConnection, request: &HttpRequest) {
+-    if let Some(rtp_info) = request.header("RTP-Info")
+-        && let Some(seq_str) = rtp_info.strip_prefix("seq=")
+-        && let Ok(next_seq) = seq_str.parse::<i32>()
+-        && let Some(rtp) = &conn.raop_rtp
+-    {
++    // Senders send `seq=N;rtptime=T`. No usable seq means flush everything.
++    let next_seq = request
++        .header("RTP-Info")
++        .and_then(|info| info.strip_prefix("seq="))
++        .and_then(|seq| seq.split(';').next())
++        .and_then(|seq| seq.parse::<i32>().ok())
++        .unwrap_or(-1);
++    if let Some(rtp) = &conn.raop_rtp {
+         rtp.flush(next_seq);
+     }
+ }
+diff --git a/src/raop/types.rs b/src/raop/types.rs
+index 9d35478..7631eb8 100644
+--- a/src/raop/types.rs
++++ b/src/raop/types.rs
+@@ -235,6 +235,8 @@ pub enum RemoteCommand {
+     ToggleRepeat,
+     /// Stop playback.
+     Stop,
++    /// Any other DACP command, as the path after `/ctrl-int/1/`.
++    Raw(String),
+ }
+ 
+ /// Unified remote control interface for AP1 (DACP) and AP2 (MediaRemote).
